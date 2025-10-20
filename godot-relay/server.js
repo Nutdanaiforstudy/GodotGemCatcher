@@ -1,4 +1,4 @@
-// server.js (enhanced with admin controls and safety caps)
+// server.js (enhanced with admin controls, safety caps, and host-triggered end_game)
 //
 // Usage:
 //  - Start normally:   node server.js
@@ -10,7 +10,8 @@
 //  POST /admin/terminate/:roomId    -> terminate single room
 //  POST /admin/terminate-all        -> terminate all rooms
 //
-// Keeps original behavior (hello, host_request, join, start, gem_spawn, caught/missed).
+// Supports hello, host_request, join, start, gem_spawn, caught/missed,
+// and new host end_game request handling.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -32,7 +33,7 @@ const wss = new WebSocket.Server({ noServer: true });
 
 // Rooms: Map<roomId, roomObj>
 const rooms = new Map();
-// Leaderboard
+// Leaderboard: array of { name, score } sorted desc
 const leaderboard = [];
 
 // HTTP helpers
@@ -68,7 +69,7 @@ app.get('/admin/rooms', requireAdmin, (req, res) => {
   const out = {};
   for (const [id, room] of rooms.entries()) {
     out[id] = {
-      players: Array.from(room.players.values ? room.players.values() : []),
+      players: Array.from(room.players ? room.players.values() : []),
       clientsCount: room.clients ? room.clients.size : 0,
       hostId: room.hostId,
       running: !!room.running,
@@ -122,7 +123,7 @@ function broadcastRoom(room, payload, exceptWs = null) {
     try {
       if (c.readyState === WebSocket.OPEN && c !== exceptWs) c.send(s);
     } catch (e) {
-      // ignore
+      // ignore per-connection send errors
     }
   }
 }
@@ -152,12 +153,22 @@ function terminateRoom(roomId, reason = 'admin') {
     for (const c of Array.from(room.clients)) {
       try {
         if (c.readyState === WebSocket.OPEN) {
-          // optionally give them a moment to receive termination message
+          // send a close code and reason; clients should handle this cleanly
           c.close(4000, `room_terminated:${reason}`);
         }
       } catch (e) { /* ignore */ }
     }
   } catch (e) { /* ignore */ }
+
+  // optionally update leaderboard with host info when admin terminates
+  try {
+    if (room.hostId) {
+      // simple heuristic: give host a score equal to gemCount (or 0)
+      const score = room.gemCount || 0;
+      leaderboard.push({ name: room.hostId, score });
+      leaderboard.sort((a, b) => b.score - a.score);
+    }
+  } catch (e) { /* ignore leaderboard failures */ }
 
   // remove room
   rooms.delete(roomId);
@@ -216,6 +227,7 @@ wss.on('connection', (ws, req) => {
     if (j.type === 'join' && typeof j.room === 'string') {
       const room = rooms.get(j.room);
       if (!room) { ws.send(JSON.stringify({ type:'join_response', ok:false, reason:'room not found' })); return; }
+      // optional: limit players per room (4 for example)
       if (room.clients.size >= 4) { ws.send(JSON.stringify({ type:'join_response', ok:false, reason:'room full' })); return; }
       const playerId = j.playerId || ('P' + crypto.randomBytes(2).toString('hex'));
       room.clients.add(ws);
@@ -244,6 +256,36 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // ---------- End game request (host can request to terminate the room) ----------
+    if (j.type === 'end_game' && ws.roomId) {
+      const room = rooms.get(ws.roomId);
+      if (!room) {
+        ws.send(JSON.stringify({ type:'end_ack', ok:false, reason:'room_missing' }));
+        return;
+      }
+      if (room.hostWs !== ws) {
+        ws.send(JSON.stringify({ type:'end_ack', ok:false, reason:'not_host' }));
+        return;
+      }
+
+      // Respond to host immediately
+      ws.send(JSON.stringify({ type: 'end_ack', ok: true, room: ws.roomId }));
+
+      // Optionally add host to leaderboard with room's gemCount (simple score)
+      try {
+        const score = room.gemCount || 0;
+        leaderboard.push({ name: room.hostId || 'host', score });
+        leaderboard.sort((a, b) => b.score - a.score);
+      } catch (e) { /* ignore leaderboard update errors */ }
+
+      // Terminate the room gracefully (broadcast and close sockets)
+      const terminated = terminateRoom(ws.roomId, 'host_requested_end');
+      if (!terminated) {
+        console.warn(`end_game requested but terminateRoom failed for ${ws.roomId}`);
+      }
+      return;
+    }
+
     // ---------- caught / missed ----------
     if ((j.type === 'caught' || j.type === 'missed') && ws.roomId) {
       const info = findRoomByWs(ws);
@@ -256,12 +298,26 @@ wss.on('connection', (ws, req) => {
         room.clients.delete(ws);
         broadcastRoom(room, { type:'player_eliminated', playerId: pid });
         console.log(`Player eliminated ${pid} in room ${info.id}`);
+
+        // If only one player left, declare winner and cleanup
         if (room.players.size === 1) {
           const winner = Array.from(room.players.values())[0];
+
+          // Update leaderboard with winner
+          try {
+            const score = room.gemCount || 0;
+            leaderboard.push({ name: winner, score });
+            leaderboard.sort((a, b) => b.score - a.score);
+          } catch (e) { /* ignore */ }
+
           broadcastRoom(room, { type:'match_over', winner });
           room.running = false;
           console.log(`Match over in ${info.id}, winner ${winner}`);
+
+          // optionally terminate room immediately
+          terminateRoom(info.id, 'match_over');
         }
+
         if (room.clients.size === 0) {
           rooms.delete(info.id);
           console.log(`Deleted empty room ${info.id}`);
