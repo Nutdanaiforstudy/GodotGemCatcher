@@ -1,4 +1,17 @@
-// server.js  (modified to accept "hello")
+// server.js (enhanced with admin controls and safety caps)
+//
+// Usage:
+//  - Start normally:   node server.js
+//  - Set admin token:  ADMIN_TOKEN=yourtoken node server.js
+//
+// Admin endpoints (protected by ADMIN_TOKEN header x-admin-token if configured,
+// otherwise only accessible from localhost):
+//  GET  /admin/rooms                -> list rooms status
+//  POST /admin/terminate/:roomId    -> terminate single room
+//  POST /admin/terminate-all        -> terminate all rooms
+//
+// Keeps original behavior (hello, host_request, join, start, gem_spawn, caught/missed).
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
@@ -8,6 +21,13 @@ const app = express();
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 8080;
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+
+// safety caps
+const MAX_SPAWN_SPEED = parseFloat(process.env.MAX_SPAWN_SPEED || "10000"); // absolute cap
+const SPEED_INCREASE_FACTOR = 1.1; // same as original 10% increase
+const MAX_GEM_COUNT = parseInt(process.env.MAX_GEM_COUNT || "200000"); // guard against runaway
+
 const wss = new WebSocket.Server({ noServer: true });
 
 // Rooms: Map<roomId, roomObj>
@@ -27,6 +47,54 @@ app.post('/leaderboard', (req, res) => {
   res.json({ ok: true });
 });
 
+// --- admin middleware ---
+function requireAdmin(req, res, next) {
+  if (ADMIN_TOKEN) {
+    const token = req.get('x-admin-token') || req.query.admin_token;
+    if (!token || token !== ADMIN_TOKEN) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    return next();
+  } else {
+    // restrict to localhost when no admin token present
+    const ip = req.ip || req.connection.remoteAddress;
+    if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
+    return res.status(403).json({ error: 'admin access restricted (set ADMIN_TOKEN to enable remote admin)' });
+  }
+}
+
+// admin list rooms
+app.get('/admin/rooms', requireAdmin, (req, res) => {
+  const out = {};
+  for (const [id, room] of rooms.entries()) {
+    out[id] = {
+      players: Array.from(room.players.values ? room.players.values() : []),
+      clientsCount: room.clients ? room.clients.size : 0,
+      hostId: room.hostId,
+      running: !!room.running,
+      gemSeq: room.gemSeq || 0,
+      gemCount: room.gemCount || 0,
+      spawnSpeed: room.spawnSpeed || 0
+    };
+  }
+  res.json(out);
+});
+
+// admin terminate a specific room
+app.post('/admin/terminate/:roomId', requireAdmin, (req, res) => {
+  const roomId = req.params.roomId;
+  const ok = terminateRoom(roomId, 'admin_terminate');
+  if (ok) res.json({ ok: true, room: roomId });
+  else res.status(404).json({ ok: false, error: 'room not found' });
+});
+
+// admin terminate all rooms
+app.post('/admin/terminate-all', requireAdmin, (req, res) => {
+  const ids = Array.from(rooms.keys());
+  ids.forEach(id => terminateRoom(id, 'admin_terminate_all'));
+  res.json({ ok: true, terminated: ids.length });
+});
+
 const server = app.listen(PORT, () => console.log(`HTTP server listening on ${PORT}`));
 
 // upgrade for websocket
@@ -42,22 +110,64 @@ function genRoomId() {
 }
 
 function broadcastRoom(room, payload, exceptWs = null) {
-  const s = JSON.stringify(payload);
+  // payload may be an object or a pre-stringified JSON
+  let s;
+  if (typeof payload === 'string') s = payload;
+  else {
+    try { s = JSON.stringify(payload); }
+    catch (e) { s = JSON.stringify({ type: 'error', message: 'payload_serialize_failed' }); }
+  }
+  if (!room || !room.clients) return;
   for (const c of room.clients) {
-    if (c.readyState === WebSocket.OPEN && c !== exceptWs) c.send(s);
+    try {
+      if (c.readyState === WebSocket.OPEN && c !== exceptWs) c.send(s);
+    } catch (e) {
+      // ignore
+    }
   }
 }
 
 function findRoomByWs(ws) {
   for (const [id, room] of rooms.entries()) {
-    if (room.clients.has(ws)) return { id, room };
+    if (room.clients && room.clients.has(ws)) return { id, room };
   }
   return null;
 }
 
+// terminate a room and clean up sockets and memory
+function terminateRoom(roomId, reason = 'admin') {
+  const room = rooms.get(roomId);
+  if (!room) return false;
+
+  // mark not running so spawnLoop will not continue
+  room.running = false;
+
+  // notify clients and close connections
+  try {
+    broadcastRoom(room, { type: 'room_terminated', room: roomId, reason });
+  } catch (e) { /* ignore */ }
+
+  // close client sockets and remove references
+  try {
+    for (const c of Array.from(room.clients)) {
+      try {
+        if (c.readyState === WebSocket.OPEN) {
+          // optionally give them a moment to receive termination message
+          c.close(4000, `room_terminated:${reason}`);
+        }
+      } catch (e) { /* ignore */ }
+    }
+  } catch (e) { /* ignore */ }
+
+  // remove room
+  rooms.delete(roomId);
+  console.log(`Room ${roomId} terminated (${reason}).`);
+  return true;
+}
+
 // WebSocket connection handling
 wss.on('connection', (ws, req) => {
-  console.log('New WS connection from', req.socket.remoteAddress || req.headers['x-forwarded-for']);
+  console.log('New WS connection from', req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown');
   ws.playerId = null;
   ws.roomId = null;
 
@@ -68,13 +178,10 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // ---------- Hello (new) ----------
-    // Accepts: { type: "hello", name: "..." }
-    // This sets ws.playerId so server knows who connected (but not in a room yet).
+    // ---------- Hello ----------
     if (j.type === 'hello') {
       const clientName = (typeof j.name === 'string' && j.name.length > 0) ? j.name : ('Player-' + crypto.randomBytes(2).toString('hex'));
       ws.playerId = clientName;
-      // Do not assign a room here; this just acknowledges who we are.
       ws.send(JSON.stringify({ type: 'hello_ack', ok: true, name: clientName }));
       console.log(`Hello from ${clientName} (no room)`);
       return;
@@ -132,8 +239,8 @@ wss.on('connection', (ws, req) => {
       room.gemCount = 0;
       room.spawnSpeed = 1.0;
       broadcastRoom(room, { type:'start', room: ws.roomId, seed: Date.now() });
-      spawnLoop(room, ws.roomId);
       console.log(`Match started in ${ws.roomId}`);
+      spawnLoop(room, ws.roomId);
       return;
     }
 
@@ -155,7 +262,10 @@ wss.on('connection', (ws, req) => {
           room.running = false;
           console.log(`Match over in ${info.id}, winner ${winner}`);
         }
-        if (room.clients.size === 0) rooms.delete(info.id);
+        if (room.clients.size === 0) {
+          rooms.delete(info.id);
+          console.log(`Deleted empty room ${info.id}`);
+        }
       } else if (j.type === 'caught') {
         // broadcast caught so other clients can update UI
         broadcastRoom(room, { type:'player_caught', playerId: pid, gemId: j.gemId });
@@ -167,9 +277,8 @@ wss.on('connection', (ws, req) => {
     if (ws.roomId) {
       const info = findRoomByWs(ws);
       if (!info) { ws.send(JSON.stringify({ type:'error', message:'not joined' })); return; }
-      // relay other messages to the room
-      const out = JSON.stringify(j);
-      broadcastRoom(info.room, out, ws);
+      // relay other messages to the room (payload is already object; broadcastRoom will stringify)
+      broadcastRoom(info.room, j, ws);
     } else {
       // unknown message from client not in room -> error
       ws.send(JSON.stringify({ type:'error', message:'not joined' }));
@@ -200,24 +309,47 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => console.warn('WS error', err && err.message ? err.message : err));
 });
 
-// server-side spawn loop
+// server-side spawn loop (recursive setTimeout)
 function spawnLoop(room, roomId) {
-  if (!room.running) return;
+  if (!room || !room.running) return;
   const baseIntervalMs = 1000;
   const intervalMs = Math.max(200, Math.floor(baseIntervalMs / room.spawnSpeed));
   setTimeout(() => {
-    if (!room.running) return;
-    room.gemSeq += 1;
-    room.gemCount += 1;
-    const gemId = 'g' + room.gemSeq;
-    const x = Math.floor(Math.random() * 800); // clients should adapt world width
-    const speed = room.spawnSpeed;
-    broadcastRoom(room, { type:'gem_spawn', room: roomId, gemId, x, speed, seq: room.gemSeq, time: Date.now() });
-    if (room.gemCount % 25 === 0) {
-      room.spawnSpeed *= 1.1; // increase 10%
-      broadcastRoom(room, { type:'speed_update', spawnSpeed: room.spawnSpeed });
-      console.log(`Room ${roomId} speed up -> ${room.spawnSpeed}`);
+    // check room still exists and running
+    const currentRoom = rooms.get(roomId);
+    if (!currentRoom || !currentRoom.running) return;
+
+    // safety guard: if gemCount is crazy high, auto-terminate
+    currentRoom.gemSeq = (currentRoom.gemSeq || 0) + 1;
+    currentRoom.gemCount = (currentRoom.gemCount || 0) + 1;
+
+    if (currentRoom.gemCount > MAX_GEM_COUNT) {
+      console.warn(`Room ${roomId} exceeded MAX_GEM_COUNT (${currentRoom.gemCount}) -> terminating.`);
+      terminateRoom(roomId, 'max_gem_count');
+      return;
     }
-    spawnLoop(room, roomId);
+
+    const gemId = 'g' + currentRoom.gemSeq;
+    const x = Math.floor(Math.random() * 800); // clients should adapt world width
+    const speed = currentRoom.spawnSpeed;
+
+    broadcastRoom(currentRoom, { type:'gem_spawn', room: roomId, gemId, x, speed, seq: currentRoom.gemSeq, time: Date.now() });
+
+    // speed increase every 25 gems
+    if (currentRoom.gemCount % 25 === 0) {
+      currentRoom.spawnSpeed = Math.min(MAX_SPAWN_SPEED, currentRoom.spawnSpeed * SPEED_INCREASE_FACTOR);
+      broadcastRoom(currentRoom, { type:'speed_update', spawnSpeed: currentRoom.spawnSpeed });
+      console.log(`Room ${roomId} speed up -> ${currentRoom.spawnSpeed}`);
+
+      // If spawnSpeed reached cap, optionally terminate (you can also choose to just cap)
+      if (currentRoom.spawnSpeed >= MAX_SPAWN_SPEED) {
+        console.warn(`Room ${roomId} reached MAX_SPAWN_SPEED (${MAX_SPAWN_SPEED}) -> terminating.`);
+        terminateRoom(roomId, 'max_spawn_speed');
+        return;
+      }
+    }
+
+    // continue loop
+    spawnLoop(currentRoom, roomId);
   }, intervalMs);
 }
