@@ -1,16 +1,12 @@
-// server.js (enhanced with admin controls and safety caps)
+// server.js (enhanced with admin controls + temporary unprotected shutdown endpoint)
+//
+// TEMPORARY: contains POST /admin/terminate-all-unprotected which will terminate
+// all rooms and then exit the Node process. REMOVE this endpoint after use.
 //
 // Usage:
 //  - Start normally:   node server.js
-//  - Set admin token:  ADMIN_TOKEN=yourtoken node server.js
-//
-// Admin endpoints (protected by ADMIN_TOKEN header x-admin-token if configured,
-// otherwise only accessible from localhost):
-//  GET  /admin/rooms                -> list rooms status
-//  POST /admin/terminate/:roomId    -> terminate single room
-//  POST /admin/terminate-all        -> terminate all rooms
-//
-// Keeps original behavior (hello, host_request, join, start, gem_spawn, caught/missed).
+//  - For safer admin, set ADMIN_TOKEN=yourtoken and use /admin/terminate/:roomId etc.
+//  - If you cannot access the shell, call the unprotected endpoint once (see below).
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -47,7 +43,7 @@ app.post('/leaderboard', (req, res) => {
   res.json({ ok: true });
 });
 
-// --- admin middleware ---
+// --- admin middleware (use if ADMIN_TOKEN set) ---
 function requireAdmin(req, res, next) {
   if (ADMIN_TOKEN) {
     const token = req.get('x-admin-token') || req.query.admin_token;
@@ -93,6 +89,30 @@ app.post('/admin/terminate-all', requireAdmin, (req, res) => {
   const ids = Array.from(rooms.keys());
   ids.forEach(id => terminateRoom(id, 'admin_terminate_all'));
   res.json({ ok: true, terminated: ids.length });
+});
+
+
+// ---------------------------
+// TEMPORARY UNPROTECTED ENDPOINT
+// ---------------------------
+// Call this once to immediately terminate all rooms and exit the Node process.
+// WARNING: This endpoint is unprotected. Remove it immediately after use.
+app.post('/admin/terminate-all-unprotected', (req, res) => {
+  const ids = Array.from(rooms.keys());
+  ids.forEach(id => terminateRoom(id, 'unprotected_admin_call'));
+  res.json({ ok: true, terminated: ids.length, note: 'Server will exit in 2 seconds' });
+  console.warn('UNPROTECTED terminate-all called — server will exit in 2 seconds.');
+  // give response time to flush, then exit
+  setTimeout(() => {
+    try {
+      // gracefully close WebSocket server
+      wss.clients.forEach((c) => { try { c.close(4000, 'server_shutdown'); } catch(e){} });
+      wss.close(() => {});
+    } catch (e) {}
+    try { server.close(() => {}); } catch (e) {}
+    // exit process to force Render to stop the instance
+    process.exit(0);
+  }, 2000);
 });
 
 const server = app.listen(PORT, () => console.log(`HTTP server listening on ${PORT}`));
@@ -313,7 +333,7 @@ wss.on('connection', (ws, req) => {
 function spawnLoop(room, roomId) {
   if (!room || !room.running) return;
   const baseIntervalMs = 1000;
-  const intervalMs = Math.max(200, Math.floor(baseIntervalMs / room.spawnSpeed));
+  const intervalMs = Math.max(200, Math.floor(baseIntervalMs / (room.spawnSpeed || 1.0)));
   setTimeout(() => {
     // check room still exists and running
     const currentRoom = rooms.get(roomId);
