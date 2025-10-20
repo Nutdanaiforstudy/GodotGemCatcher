@@ -1,4 +1,4 @@
-// server.js
+// server.js  (modified to accept "hello")
 const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
@@ -65,6 +65,18 @@ wss.on('connection', (ws, req) => {
     let j;
     try { j = JSON.parse(msg.toString()); } catch (e) {
       ws.send(JSON.stringify({ type: 'error', message: 'invalid json' }));
+      return;
+    }
+
+    // ---------- Hello (new) ----------
+    // Accepts: { type: "hello", name: "..." }
+    // This sets ws.playerId so server knows who connected (but not in a room yet).
+    if (j.type === 'hello') {
+      const clientName = (typeof j.name === 'string' && j.name.length > 0) ? j.name : ('Player-' + crypto.randomBytes(2).toString('hex'));
+      ws.playerId = clientName;
+      // Do not assign a room here; this just acknowledges who we are.
+      ws.send(JSON.stringify({ type: 'hello_ack', ok: true, name: clientName }));
+      console.log(`Hello from ${clientName} (no room)`);
       return;
     }
 
@@ -159,6 +171,7 @@ wss.on('connection', (ws, req) => {
       const out = JSON.stringify(j);
       broadcastRoom(info.room, out, ws);
     } else {
+      // unknown message from client not in room -> error
       ws.send(JSON.stringify({ type:'error', message:'not joined' }));
     }
   }); // end message
