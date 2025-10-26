@@ -1,19 +1,12 @@
 /**
  * server.js
  *
- * Complete, ready-to-run WebSocket + HTTP server compatible with the provided Godot client.
+ * WebSocket + HTTP server compatible with the Godot client.
  *
- * - Matches the message shapes your Godot client expects:
- *     - hello / hello_ack with name
- *     - host_request/join with playerId / name
- *     - host_response / join_response return players array
- *     - gem_spawn (server -> clients) includes 'speed' field
- *     - speed_update (server -> clients) uses { type: 'speed_update', speed: <float>, nextIncreaseThreshold: <int> }
- *     - score_update (server -> clients) uses { type: 'score_update', player: <name>, score: <int> }
- *     - caught/missed accepted from client: either with { name } field or by ws association
- * - Per-room progression: baseSpeed starts at 110, each room picks randomized thresholds in [20,35],
- *   when threshold reached baseSpeed += 1, room notifies clients with speed_update.
- * - Heartbeat, admin endpoints, safety caps, graceful shutdown.
+ * - gem_spawn uses normalized x coordinate (0..1) and includes 'normalized:true'
+ * - start/host_response/join_response include baseSpeed and nextIncreaseThreshold
+ * - spawnLoop is iterative (while) to avoid deep recursion
+ * - heartbeat, admin endpoints, graceful shutdown, safety caps included
  *
  * Usage:
  *   PORT=8080 ADMIN_TOKEN=admintoken node server.js
@@ -32,7 +25,7 @@ app.use(bodyParser.json());
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 
-const INITIAL_BASE_SPEED = parseFloat(process.env.INITIAL_BASE_SPEED || '110'); // px/s, matches client expectation
+const INITIAL_BASE_SPEED = parseFloat(process.env.INITIAL_BASE_SPEED || '110'); // px/s
 const PROGRESSION_MIN = parseInt(process.env.PROGRESSION_MIN || '20', 10);
 const PROGRESSION_MAX = parseInt(process.env.PROGRESSION_MAX || '35', 10);
 
@@ -160,10 +153,11 @@ function terminateRoom(roomId, reason = 'admin') {
     }
   } catch (e) { }
 
-  // leaderboard best-effort
+  // leaderboard best-effort: compute top score safely
   try {
     if (room.hostId) {
-      const topScore = Array.from(room.scores.entries()).reduce((acc, [k, v]) => Math.max(acc, v), 0) || room.gemCount || 0;
+      const scoresArray = Array.from(room.scores.values()).map(v => Number(v) || 0);
+      const topScore = scoresArray.length > 0 ? Math.max(...scoresArray) : (room.gemCount || 0);
       leaderboard.push({ name: room.hostId, score: topScore });
       leaderboard.sort((a, b) => b.score - a.score);
     }
@@ -229,7 +223,6 @@ wss.on('connection', (ws, req) => {
 
     // ---- HOST REQUEST ----
     if (j.type === 'host_request') {
-      // The client may send playerId/name; prefer name if provided
       const requestedName = (typeof j.playerId === 'string' && j.playerId.length > 0) ? j.playerId :
                             (typeof j.name === 'string' && j.name.length > 0) ? j.name : ('Host-' + randHex(2));
       let roomId;
@@ -259,7 +252,16 @@ wss.on('connection', (ws, req) => {
       ws.playerId = requestedName;
       ws.roomId = roomId;
 
-      try { ws.send(JSON.stringify({ type: 'host_response', ok: true, room: roomId, players: Array.from(room.players.values()), baseSpeed: room.baseSpeed, nextIncreaseThreshold: room.nextIncreaseThreshold })); } catch (e) {}
+      try {
+        ws.send(JSON.stringify({
+          type: 'host_response',
+          ok: true,
+          room: roomId,
+          players: Array.from(room.players.values()),
+          baseSpeed: room.baseSpeed,
+          nextIncreaseThreshold: room.nextIncreaseThreshold
+        }));
+      } catch (e) {}
       console.log(`Room ${roomId} created by host ${requestedName}`);
       return;
     }
@@ -270,7 +272,6 @@ wss.on('connection', (ws, req) => {
       if (!room) { try { ws.send(JSON.stringify({ type: 'join_response', ok: false, reason: 'room not found' })); } catch (e) {} return; }
       if (room.clients.size >= MAX_PLAYERS_PER_ROOM) { try { ws.send(JSON.stringify({ type: 'join_response', ok: false, reason: 'room full' })); } catch (e) {} return; }
 
-      // choose a player name: prefer provided playerId/name; ensure uniqueness in room
       let provided = (typeof j.playerId === 'string' && j.playerId.length > 0) ? j.playerId :
                      (typeof j.name === 'string' && j.name.length > 0) ? j.name : ('P-' + randHex(2));
       const existing = new Set(Array.from(room.players.values()));
@@ -285,7 +286,14 @@ wss.on('connection', (ws, req) => {
       room.lastActivityMs = now;
 
       try {
-        ws.send(JSON.stringify({ type: 'join_response', ok: true, room: j.room, players: Array.from(room.players.values()), baseSpeed: room.baseSpeed, nextIncreaseThreshold: room.nextIncreaseThreshold }));
+        ws.send(JSON.stringify({
+          type: 'join_response',
+          ok: true,
+          room: j.room,
+          players: Array.from(room.players.values()),
+          baseSpeed: room.baseSpeed,
+          nextIncreaseThreshold: room.nextIncreaseThreshold
+        }));
         broadcastRoom(room, { type: 'player_joined', playerId: playerName }, ws);
       } catch (e) {}
       console.log(`Player ${playerName} joined room ${j.room}`);
@@ -308,7 +316,14 @@ wss.on('connection', (ws, req) => {
       for (const p of room.players.values()) room.scores.set(p, 0);
       room.lastActivityMs = now;
 
-      broadcastRoom(room, { type: 'start', room: ws.roomId, seed: now, players: Array.from(room.players.values()), baseSpeed: room.baseSpeed, nextIncreaseThreshold: room.nextIncreaseThreshold });
+      broadcastRoom(room, {
+        type: 'start',
+        room: ws.roomId,
+        seed: now,
+        players: Array.from(room.players.values()),
+        baseSpeed: room.baseSpeed,
+        nextIncreaseThreshold: room.nextIncreaseThreshold
+      });
       console.log(`Match started in room ${ws.roomId}`);
       spawnLoop(room, ws.roomId).catch(err => console.error('spawnLoop error', err));
       return;
@@ -324,7 +339,8 @@ wss.on('connection', (ws, req) => {
 
       // optional leaderboard push
       try {
-        const top = Array.from(room.scores.values()).reduce((acc, v) => Math.max(acc, v), 0) || room.gemCount || 0;
+        const scoresArray = Array.from(room.scores.values()).map(v => Number(v) || 0);
+        const top = scoresArray.length > 0 ? Math.max(...scoresArray) : (room.gemCount || 0);
         leaderboard.push({ name: room.hostId || 'host', score: top });
         leaderboard.sort((a, b) => b.score - a.score);
       } catch (e) {}
@@ -334,19 +350,15 @@ wss.on('connection', (ws, req) => {
     }
 
     // ---- CAUGHT / MISSED / SCORE_UPDATE from clients ----
-    // Clients (NetworkWsClients) send { type: 'caught', gemId, name } or { type: 'missed', gemId, name } or score_update
     if ((j.type === 'caught' || j.type === 'missed' || j.type === 'score_update') && ws) {
-      // Determine player name: prefer j.name (Godot sends name) else ws.playerId
       const playerName = (typeof j.name === 'string' && j.name.length > 0) ? j.name : ws.playerId;
       const info = findRoomByWs(ws);
       if (!info) {
-        // No room context. If message included room / name but not socket association, try to find the room by playerName
         let found = null;
         for (const [rid, r] of rooms.entries()) {
           if (Array.from(r.players.values()).includes(playerName)) { found = { id: rid, room: r }; break; }
         }
         if (!found) return;
-        // proceed with found room
         processPlayerEvent(found.room, playerName, j);
         return;
       } else {
@@ -374,7 +386,6 @@ wss.on('connection', (ws, req) => {
       const pid = room.players.get(ws);
       room.players.delete(ws);
       room.clients.delete(ws);
-      // keep scores for summary, but remove mapping
       broadcastRoom(room, { type: 'player_left', playerId: pid, scores: Object.fromEntries(room.scores) });
       console.log(`Connection closed: ${pid} left room ${id}`);
 
@@ -397,18 +408,16 @@ wss.on('connection', (ws, req) => {
 
 // ---------- process player event helper ----------
 function processPlayerEvent(room, playerName, j, ws = null, roomId = null) {
-  // j.type is 'caught' | 'missed' | 'score_update'
   if (!room) return;
 
   if (j.type === 'score_update') {
-    const score = (typeof j.score === 'number') ? j.score : room.scores.get(playerName) || 0;
+    const score = (typeof j.score === 'number') ? j.score : (room.scores.get(playerName) || 0);
     room.scores.set(playerName, score);
     broadcastRoom(room, { type: 'score_update', player: playerName, score });
     return;
   }
 
   if (j.type === 'caught') {
-    // optional points
     const points = (typeof j.points === 'number') ? j.points : 1;
     const prev = room.scores.get(playerName) || 0;
     const newScore = prev + points;
@@ -416,14 +425,10 @@ function processPlayerEvent(room, playerName, j, ws = null, roomId = null) {
 
     broadcastRoom(room, { type: 'player_caught', playerId: playerName, gemId: j.gemId || '', points, scores: Object.fromEntries(room.scores) });
     broadcastRoom(room, { type: 'score_update', player: playerName, score: newScore });
-
-    // Nothing else (server doesn't eliminate on caught)
     return;
   }
 
   if (j.type === 'missed') {
-    // eliminate player: remove from players map and clients set (if ws provided)
-    // find ws entry for this player
     let wsToRemove = null;
     for (const [s, name] of room.players.entries()) {
       if (name === playerName) { wsToRemove = s; break; }
@@ -433,7 +438,6 @@ function processPlayerEvent(room, playerName, j, ws = null, roomId = null) {
       room.players.delete(wsToRemove);
       room.clients.delete(wsToRemove);
     } else {
-      // if no ws found, try to remove by playerName from players map
       for (const [s, name] of room.players.entries()) {
         if (name === playerName) {
           room.players.delete(s);
@@ -457,14 +461,14 @@ function processPlayerEvent(room, playerName, j, ws = null, roomId = null) {
       broadcastRoom(room, { type: 'match_over', winner, scores: scoresObj });
       // update leaderboard
       try {
-        const top = Math.max(...Object.values(scoresObj).map(v => Number(v)), 0) || room.gemCount || 0;
+        const scoresArray = Object.values(scoresObj).map(v => Number(v) || 0);
+        const top = scoresArray.length > 0 ? Math.max(...scoresArray) : (room.gemCount || 0);
         leaderboard.push({ name: winner, score: top });
         leaderboard.sort((a, b) => b.score - a.score);
       } catch (e) { }
       room.running = false;
       terminateRoom(room.id || roomId, 'match_over');
     } else {
-      // if room became empty
       if (room.clients.size === 0) {
         rooms.delete(room.id || roomId);
         console.log(`Deleted empty room ${room.id || roomId}`);
@@ -475,58 +479,67 @@ function processPlayerEvent(room, playerName, j, ws = null, roomId = null) {
   }
 }
 
-// ---------- spawn loop (authoritative) ----------
+// ---------- spawn loop (authoritative, iterative) ----------
 async function spawnLoop(room, roomId) {
   try {
     if (!room || !room.running) return;
 
-    // choose interval based on baseSpeed (tuned so players still have reaction time)
-    const baseIntervalMs = 1000;
-    const intervalMs = Math.max(150, Math.floor(baseIntervalMs / (1 + (room.baseSpeed - INITIAL_BASE_SPEED) / 200)));
+    // run until room.running becomes false
+    while (room && room.running) {
+      // choose interval based on baseSpeed (tuned so players still have reaction time)
+      const baseIntervalMs = 1000;
+      const intervalMs = Math.max(150, Math.floor(baseIntervalMs / (1 + (room.baseSpeed - INITIAL_BASE_SPEED) / 200)));
 
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
 
-    // re-check room
-    const currentRoom = rooms.get(roomId);
-    if (!currentRoom || !currentRoom.running) return;
+      const currentRoom = rooms.get(roomId);
+      if (!currentRoom || !currentRoom.running) break;
 
-    currentRoom.gemSeq = (currentRoom.gemSeq || 0) + 1;
-    currentRoom.gemCount = (currentRoom.gemCount || 0) + 1;
-    currentRoom.gemSinceLastIncrease = (currentRoom.gemSinceLastIncrease || 0) + 1;
-    currentRoom.lastActivityMs = Date.now();
+      currentRoom.gemSeq = (currentRoom.gemSeq || 0) + 1;
+      currentRoom.gemCount = (currentRoom.gemCount || 0) + 1;
+      currentRoom.gemSinceLastIncrease = (currentRoom.gemSinceLastIncrease || 0) + 1;
+      currentRoom.lastActivityMs = Date.now();
 
-    if (currentRoom.gemCount > MAX_GEM_COUNT) {
-      console.warn(`Room ${roomId} exceeded MAX_GEM_COUNT (${currentRoom.gemCount}) -> terminating.`);
-      terminateRoom(roomId, 'max_gem_count');
-      return;
-    }
-
-    const gemId = 'g' + currentRoom.gemSeq;
-    const worldWidth = 800; // suggestion for clients
-    const x = Math.floor(Math.random() * worldWidth);
-    const speed = Math.min(MAX_SPAWN_SPEED, currentRoom.baseSpeed);
-
-    // send spawn (include 'special' optionally as random 10%)
-    const special = (Math.random() < 0.1);
-    broadcastRoom(currentRoom, { type: 'gem_spawn', room: roomId, gemId, x, speed, seq: currentRoom.gemSeq, time: Date.now(), special });
-
-    // progression: when gemSinceLastIncrease reaches threshold, increment baseSpeed and reset
-    if (currentRoom.gemSinceLastIncrease >= currentRoom.nextIncreaseThreshold) {
-      currentRoom.baseSpeed = Math.min(MAX_SPAWN_SPEED, currentRoom.baseSpeed + 1);
-      currentRoom.gemSinceLastIncrease = 0;
-      currentRoom.nextIncreaseThreshold = randBetween(PROGRESSION_MIN, PROGRESSION_MAX);
-      broadcastRoom(currentRoom, { type: 'speed_update', speed: currentRoom.baseSpeed, nextIncreaseThreshold: currentRoom.nextIncreaseThreshold });
-      console.log(`Room ${roomId}: baseSpeed -> ${currentRoom.baseSpeed} nextThreshold=${currentRoom.nextIncreaseThreshold}`);
-
-      if (currentRoom.baseSpeed >= MAX_SPAWN_SPEED) {
-        console.warn(`Room ${roomId} reached MAX_SPAWN_SPEED (${MAX_SPAWN_SPEED}) -> terminating.`);
-        terminateRoom(roomId, 'max_spawn_speed');
+      if (currentRoom.gemCount > MAX_GEM_COUNT) {
+        console.warn(`Room ${roomId} exceeded MAX_GEM_COUNT (${currentRoom.gemCount}) -> terminating.`);
+        terminateRoom(roomId, 'max_gem_count');
         return;
       }
-    }
 
-    // continue loop
-    return spawnLoop(currentRoom, roomId);
+      const gemId = 'g' + currentRoom.gemSeq;
+      // IMPORTANT: send normalized X in 0..1 so clients map to their own camera/world width
+      const xNormalized = Math.random(); // 0..1
+      const speed = Math.min(MAX_SPAWN_SPEED, currentRoom.baseSpeed);
+      const special = (Math.random() < 0.1);
+
+      // Broadcast normalized x with explicit flag 'normalized:true'
+      broadcastRoom(currentRoom, {
+        type: 'gem_spawn',
+        room: roomId,
+        gemId,
+        x: xNormalized,
+        normalized: true,
+        speed,
+        seq: currentRoom.gemSeq,
+        time: Date.now(),
+        special
+      });
+
+      // progression: when gemSinceLastIncrease reaches threshold, increment baseSpeed and reset
+      if (currentRoom.gemSinceLastIncrease >= currentRoom.nextIncreaseThreshold) {
+        currentRoom.baseSpeed = Math.min(MAX_SPAWN_SPEED, currentRoom.baseSpeed + 1);
+        currentRoom.gemSinceLastIncrease = 0;
+        currentRoom.nextIncreaseThreshold = randBetween(PROGRESSION_MIN, PROGRESSION_MAX);
+        broadcastRoom(currentRoom, { type: 'speed_update', speed: currentRoom.baseSpeed, nextIncreaseThreshold: currentRoom.nextIncreaseThreshold });
+        console.log(`Room ${roomId}: baseSpeed -> ${currentRoom.baseSpeed} nextThreshold=${currentRoom.nextIncreaseThreshold}`);
+
+        if (currentRoom.baseSpeed >= MAX_SPAWN_SPEED) {
+          console.warn(`Room ${roomId} reached MAX_SPAWN_SPEED (${MAX_SPAWN_SPEED}) -> terminating.`);
+          terminateRoom(roomId, 'max_spawn_speed');
+          return;
+        }
+      }
+    }
   } catch (err) {
     console.error('spawnLoop caught', err && err.stack ? err.stack : err);
   }
